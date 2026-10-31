@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "learn-pytorch"
+version = "1.0.0"
+description = "Companion code for the Learn PyTorch masterclass guide"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "The Learning Hub" }]
+requires-python = ">=3.10"
+dependencies = ["torch>=2.6"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+learn-pytorch = "learn_pytorch.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

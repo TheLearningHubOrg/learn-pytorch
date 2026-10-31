@@ -1,0 +1,4 @@
+# CPU-only wheels keep installs small:
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.6
+pytest>=8
