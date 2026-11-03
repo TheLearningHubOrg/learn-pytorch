@@ -106,7 +106,7 @@ source .venv/bin/activate            # Windows: .venv\Scripts\activate
 # 2a. CPU-only wheels (small download, ideal for laptops and CI)
 pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-# 2b. NVIDIA GPU wheels: pick the CUDA tag the selector recommends (e.g. cu126, cu128)
+# 2b. NVIDIA GPU wheels: pick the CUDA tag the selector recommends (e.g. cu128, cu130)
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
 
 # 2c. macOS (Apple Silicon): the default PyPI wheel already includes the MPS backend
@@ -137,7 +137,7 @@ d = torch.randn(4, 4, generator=torch.Generator().manual_seed(42))
 
 print(a.shape, a.dtype, a.device)                # torch.Size([2, 2]) torch.float32 cpu
 
-# 2. dtype conversion: integer division and float math do not mix silently
+# 2. dtype conversion: int64 and float32 promote to float32 when combined
 labels = torch.tensor([0, 2, 1])                 # int64, what CrossEntropyLoss expects
 half = a.to(torch.bfloat16)                      # reduced precision copy
 
@@ -495,7 +495,7 @@ def main() -> None:
         print(padded.shape, lengths.tolist(), labels.tolist())
 
 
-if __name__ == "__main__":         # required on Windows/macOS, where workers are spawned
+if __name__ == "__main__":         # required wherever workers are spawned, not forked
     main()
 ```
 
@@ -503,7 +503,7 @@ Production tuning rules:
 
 1. **`num_workers`**: start around the number of physical cores divided by GPUs per node, then measure. If GPU utilisation is low and the CPU is busy decoding, add workers.
 2. **`pin_memory=True` + `.to(device, non_blocking=True)`** lets host-to-device copies overlap with compute.
-3. **Worker memory growth**: workers fork the parent, and touching Python objects updates their reference counts, which defeats copy-on-write. A dataset holding millions of Python lists or dicts can appear to "leak" memory per worker. Store data as tensors or NumPy arrays instead.
+3. **Worker memory growth**: with the `fork` start method, workers share the parent's pages copy-on-write, and touching Python objects updates their reference counts, which defeats copy-on-write. A dataset holding millions of Python lists or dicts can appear to "leak" memory per worker. Store data as tensors or NumPy arrays instead.
 4. **Random augmentation in workers** draws from a per-worker seed that PyTorch derives for you; libraries with their own global RNG need a `worker_init_fn`.
 
 ### 3.3 Transforms & Augmentation
@@ -1068,7 +1068,7 @@ With very small datasets, keep the backbone frozen. With mid-sized datasets, unf
 
 ### 6.3 Model Export: torch.export, ONNX & AOTInductor
 
-`torch.export` produces a sound, whole-program graph (an `ExportedProgram`) with no Python dependency on your model code. It is the modern replacement for TorchScript, which is in maintenance mode.
+`torch.export` produces a sound, whole-program graph (an `ExportedProgram`) with no Python dependency on your model code. It is the modern replacement for TorchScript, which is deprecated.
 
 ```mermaid
 flowchart LR
@@ -1279,7 +1279,7 @@ python -m learn_pytorch --epochs 20 --out artifacts
 > **Answer**: First confirm it is input-bound: time the loop with the model call removed, or look for long gaps between kernels in a `torch.profiler` trace. Typical fixes are raising `num_workers`, enabling `pin_memory` with `non_blocking=True` copies, `persistent_workers=True`, decoding images on the GPU (for example with `torchvision.io.decode_jpeg` on CUDA or NVIDIA DALI), storing data in sequential shard formats instead of millions of small files, and removing per-step `.item()` sync points. Only after the input pipeline keeps up is it worth tuning the model with AMP or `torch.compile`.
 
 #### Q8: Each DataLoader worker's memory grows over the epoch even though the dataset is read-only. Why?
-> **Answer**: Workers are forked copies of the main process and share pages copy-on-write. Python reference counting writes to every object it touches, so iterating over a dataset stored as Python lists of dicts or strings gradually copies those pages into each worker. With 8 workers this looks like an 8x memory leak. Store metadata as NumPy arrays, tensors, or Arrow tables (one large buffer instead of millions of objects) so reads do not dirty pages.
+> **Answer**: Under the `fork` start method, workers are copies of the main process that share pages copy-on-write. Python reference counting writes to every object it touches, so iterating over a dataset stored as Python lists of dicts or strings gradually copies those pages into each worker. With 8 workers this looks like an 8x memory leak. Store metadata as NumPy arrays, tensors, or Arrow tables (one large buffer instead of millions of objects) so reads do not dirty pages.
 
 #### Q9: Why does BatchNorm misbehave with tiny per-GPU batches or when fine-tuning a frozen backbone?
 > **Answer**: BatchNorm normalises with batch statistics in training mode; with 2 to 4 samples per GPU those statistics are noisy, and the running averages used at inference drift away from the real distribution. Options are `nn.SyncBatchNorm` to compute statistics across all ranks, switching to `GroupNorm` or `LayerNorm`, or freezing BN entirely. When freezing a backbone, setting `requires_grad=False` is not enough: running statistics still update in `train()` mode, so the BN modules must also be put into `eval()`.
@@ -1288,13 +1288,13 @@ python -m learn_pytorch --epochs 20 --out artifacts
 > **Answer**: fp16 has only 5 exponent bits, so small gradients (below about $6 \times 10^{-8}$) underflow to zero. `GradScaler` multiplies the loss by a large factor before `backward()`, unscales before the optimizer step, skips steps that produced inf/NaN, and adapts the factor over time. bf16 keeps fp32's 8-bit exponent, so it has the same dynamic range and needs no scaler, at the cost of fewer mantissa bits. On Ampere or newer GPUs and on modern CPUs, bf16 is the default choice; fp16 remains for older GPUs and some inference paths.
 
 #### Q11: After adding `torch.compile`, the first epoch is slow and the speed-up disappears when sequence length varies. Explain.
-> **Answer**: Compilation happens lazily on the first call for each new set of guards (shape, dtype, device, some Python values). Varying sequence lengths fail the shape guards and trigger recompilation; after a few recompiles Dynamo marks the dimension dynamic or eventually falls back to eager. Fix it by padding to a small set of length buckets, passing `dynamic=True` or calling `torch._dynamo.mark_dynamic` on the varying dimension, and checking `TORCH_LOGS="recompiles"`. For short jobs, also consider whether compile time is earned back at all.
+> **Answer**: Compilation happens lazily on the first call for each new set of guards (shape, dtype, device, some Python values). Varying sequence lengths fail the shape guards and trigger recompilation; after the first size change Dynamo automatically retries with that dimension marked dynamic, and if guards keep failing it hits the recompile limit and falls back to eager for that frame. Fix it by padding to a small set of length buckets, passing `dynamic=True` or calling `torch._dynamo.mark_dynamic` on the varying dimension, and checking `TORCH_LOGS="recompiles"`. For short jobs, also consider whether compile time is earned back at all.
 
 #### Q12: Why is `DistributedDataParallel` preferred over `DataParallel` even on one machine?
 > **Answer**: `DataParallel` runs one Python process with a thread per GPU, so it is limited by the GIL, re-broadcasts parameters from GPU 0 every step, and gathers outputs back to GPU 0, which becomes a memory and compute hotspot. DDP uses one process per GPU, keeps a full replica on each, and overlaps a bucketed all-reduce of gradients with the backward pass. It scales to multiple nodes with the same code and is the supported path for all further parallelism.
 
 #### Q13: How does DDP keep replicas in sync, and what breaks if some parameters do not receive gradients?
-> **Answer**: DDP broadcasts the initial weights from rank 0, then registers autograd hooks that group gradients into buckets and launch an all-reduce as soon as a bucket is ready, overlapping communication with the rest of backward. Every rank must therefore produce gradients for the same parameters. If a branch is skipped on some ranks (conditional heads, unused embeddings), the all-reduce waits forever and the job hangs. Pass `find_unused_parameters=True` (which costs an extra graph traversal) or restructure the model so every parameter participates.
+> **Answer**: DDP broadcasts the initial weights from rank 0, then registers autograd hooks that group gradients into buckets and launch an all-reduce as soon as a bucket is ready, overlapping communication with the rest of backward. Every rank must therefore produce gradients for the same parameters. If some parameters get no gradient (conditional heads, unused embeddings), DDP raises an "expected to have finished reduction" error on the next iteration, and if the skipped branch differs between ranks the collectives can mismatch and the job hangs. Pass `find_unused_parameters=True` (which costs an extra graph traversal each step) or restructure the model so every parameter participates.
 
 #### Q14: How much GPU memory does full fine-tuning of a 7B-parameter model with AdamW need, and how do you make it fit?
 > **Answer**: With mixed precision and fp32 master weights, a common accounting is 2 bytes (bf16 weights) + 2 (bf16 grads) + 4 (fp32 master copy) + 8 (two fp32 Adam moments) = 16 bytes per parameter, so $7 \times 10^9 \times 16 \approx 112$ GB before activations. That exceeds one 80 GB GPU. FSDP2 shards those 112 GB across ranks (14 GB each on 8 GPUs), activation checkpointing cuts activation memory, and parameter-efficient methods such as LoRA avoid optimizer state for most weights entirely.
@@ -1312,7 +1312,7 @@ python -m learn_pytorch --epochs 20 --out artifacts
 > **Answer**: `torch.save` uses pickle, and unpickling can construct arbitrary objects and call arbitrary functions, so loading a malicious `.pt` file can execute code. `weights_only=True`, the default in recent releases, restricts unpickling to tensors, primitive types and an allowlist, failing on anything else. For distribution, the `safetensors` format avoids pickle entirely and also supports memory-mapped, zero-copy loading.
 
 #### Q19: Why prefer `torch.export` over TorchScript for new deployments?
-> **Answer**: TorchScript required a restricted subset of Python or a tracer that silently recorded only one control-flow path, and it is in maintenance mode. `torch.export` uses the same Dynamo capture as `torch.compile` but demands a single complete graph: it either captures the whole program soundly or fails with a clear error. The resulting `ExportedProgram` is in a standardised ATen operator set with explicit shape constraints, and it feeds ONNX, AOTInductor and ExecuTorch from one artifact.
+> **Answer**: TorchScript required a restricted subset of Python or a tracer that silently recorded only one control-flow path, and it is now deprecated. `torch.export` uses the same Dynamo capture as `torch.compile` but demands a single complete graph: it either captures the whole program soundly or fails with a clear error. The resulting `ExportedProgram` is in a standardised ATen operator set with explicit shape constraints, and it feeds ONNX, AOTInductor and ExecuTorch from one artifact.
 
 #### Q20: Your exported model only accepts batch size 4. Why, and how do you fix it?
 > **Answer**: `torch.export` specialises every dimension to the example input unless told otherwise. Declare dynamic dimensions with `dynamic_shapes={"x": {0: torch.export.Dim("batch", min=1, max=4096)}}`, where the key matches the `forward()` argument name. If export then reports a constraint violation, the model code relies on a concrete size (for example a `view(4, -1)` or a Python `if x.shape[0] > 2`), which must be rewritten to use symbolic sizes. Using an example batch larger than 1 also avoids the special-casing of size 0 and 1 dimensions.
